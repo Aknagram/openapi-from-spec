@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ТЗ → OpenAPI 3.0.3</title>
+  <style>
+    :root { color-scheme: light; }
+    body { margin: 0; font: 16px/1.45 "Segoe UI", sans-serif; color: #172033; background: #f4f6f8; }
+    main { max-width: 1100px; margin: 0 auto; padding: 24px; }
+    h1 { font-size: 28px; margin: 0 0 8px; }
+    p { margin: 0 0 16px; color: #3d4b61; }
+    label { display: block; font-weight: 600; margin: 12px 0 6px; }
+    input[type="text"] { width: 100%; box-sizing: border-box; padding: 8px 10px; border: 1px solid #c5d0dc; border-radius: 8px; }
+    textarea { width: 100%; min-height: 280px; box-sizing: border-box; padding: 10px; border: 1px solid #c5d0dc; border-radius: 8px; font: 14px/1.4 Consolas, monospace; }
+    .row { display: flex; gap: 8px; align-items: center; margin: 12px 0; flex-wrap: wrap; }
+    button { background: #1f6feb; color: white; border: 0; border-radius: 8px; padding: 10px 14px; font: inherit; cursor: pointer; }
+    button.secondary { background: white; color: #172033; border: 1px solid #c5d0dc; }
+    button:disabled { opacity: 0.6; cursor: wait; }
+    .filename { color: #3d4b61; }
+    textarea.drop { outline: 2px solid #1f6feb; background: #eef4ff; }
+    input[type="file"] { display: none; }
+    .grid { display: grid; grid-template-columns: 1.2fr 0.8fr; gap: 16px; }
+    pre { white-space: pre-wrap; background: white; border: 1px solid #d7e0ea; border-radius: 8px; padding: 12px; min-height: 120px; }
+    .status { min-height: 24px; margin: 8px 0; }
+    @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>ТЗ → OpenAPI 3.0.3</h1>
+  <p>Приложите Markdown-файл или вставьте текст спецификации. Код разберёт таблицы и соберёт YAML. Модель vLLM, если она настроена на сервере, вызывается только для фрагмента, который не разобрался, и не пишет YAML сама.</p>
+  <label for="title">Название API</label>
+  <input id="title" type="text" value="API">
+  <label for="file">Файл ТЗ</label>
+  <div class="row">
+    <button class="secondary" id="attach" type="button">Приложить .md</button>
+    <span class="filename" id="filename">файл не выбран</span>
+    <button class="secondary" id="sample" type="button">Пример остатков</button>
+    <input id="file" type="file" accept=".md,.markdown,.txt,text/markdown,text/plain">
+  </div>
+  <label for="source">Текст ТЗ</label>
+  <textarea id="source" placeholder="Приложите .md или вставьте текст. Сюда же можно перетащить файл.&#10;GET accountBalances&#10;Описание&#10;..."></textarea>
+  <div class="row">
+    <button id="run" type="button">Собрать спецификацию</button>
+    <button class="secondary" id="save" type="button" disabled>Скачать YAML</button>
+  </div>
+  <div class="status" id="status"></div>
+  <div class="grid">
+    <section>
+      <h2>YAML</h2>
+      <pre id="yaml">Здесь появится спецификация.</pre>
+    </section>
+    <section>
+      <h2>Вопросы и соглашения</h2>
+      <pre id="report">Пробелы, шаблонные ответы и вызовы модели.</pre>
+    </section>
+  </div>
+</main>
+<script>
+const source = document.querySelector("#source");
+const yaml = document.querySelector("#yaml");
+const report = document.querySelector("#report");
+const status = document.querySelector("#status");
+const save = document.querySelector("#save");
+let latest = "";
+
+const fileInput = document.querySelector("#file");
+const filename = document.querySelector("#filename");
+
+document.querySelector("#attach").addEventListener("click", () => fileInput.click());
+fileInput.addEventListener("change", () => {
+  const file = fileInput.files && fileInput.files[0];
+  if (file) loadFile(file);
+});
+
+source.addEventListener("dragover", (event) => {
+  event.preventDefault();
+  source.classList.add("drop");
+});
+source.addEventListener("dragleave", () => source.classList.remove("drop"));
+source.addEventListener("drop", (event) => {
+  event.preventDefault();
+  source.classList.remove("drop");
+  const file = event.dataTransfer && event.dataTransfer.files && event.dataTransfer.files[0];
+  if (file) loadFile(file);
+});
+
+async function loadFile(file) {
+  const name = file.name || "файл";
+  const allowed = /\.(md|markdown|txt)$/i.test(name) || (file.type || "").startsWith("text/");
+  if (!allowed) {
+    status.textContent = "Нужен файл .md или .txt";
+    return;
+  }
+  source.value = await file.text();
+  filename.textContent = name;
+  const title = document.querySelector("#title");
+  if (!title.value || title.value === "API") {
+    title.value = name.replace(/\.(md|markdown|txt)$/i, "");
+  }
+  status.textContent = "Загружен файл " + name;
+}
+
+document.querySelector("#sample").addEventListener("click", async () => {
+  const response = await fetch("/sample");
+  source.value = await response.text();
+});
+
+document.querySelector("#run").addEventListener("click", async () => {
+  const button = document.querySelector("#run");
+  button.disabled = true;
+  status.textContent = "Собираю…";
+  try {
+    const response = await fetch("/v1/convert", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({text: source.value, title: document.querySelector("#title").value || "API"})
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      status.textContent = payload.error || "Ошибка запроса";
+      return;
+    }
+    latest = payload.yaml || "";
+    yaml.textContent = latest;
+    const gaps = (payload.report && payload.report.gaps) || [];
+    const conventions = (payload.report && payload.report.conventions) || [];
+    const calls = payload.report ? payload.report.model_calls : 0;
+    const lines = [
+      "Вызовов модели: " + calls,
+      "Вопросов: " + gaps.length,
+      ...gaps.map((gap) => "• " + (gap.operation ? gap.operation + ": " : "") + gap.question),
+      "",
+      "Соглашения:",
+      ...conventions.map((item) => "• " + item)
+    ];
+    if (payload.errors && payload.errors.length) {
+      lines.push("", "Ошибки проверки:", ...payload.errors.map((item) => "• " + item));
+    }
+    report.textContent = lines.join("\n");
+    save.disabled = !latest;
+    status.textContent = "Готово";
+  } catch (error) {
+    status.textContent = "Не удалось собрать спецификацию";
+  } finally {
+    button.disabled = false;
+  }
+});
+
+save.addEventListener("click", () => {
+  const blob = new Blob([latest], {type: "application/yaml"});
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = "openapi.yaml";
+  link.click();
+  URL.revokeObjectURL(link.href);
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openapi-from-spec"
+version = "0.1.0"
+description = "Сборка OpenAPI 3.0.3 YAML из текстового ТЗ REST API"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["PyYAML>=6", "httpx>=0.27", "openapi-spec-validator>=0.7"]
+
+[project.scripts]
+openapi-from-spec = "openapi_from_spec.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+openapi_from_spec = ["skill/*.md", "skill/knowledge/*.md", "static/*"]
