@@ -1,7 +1,16 @@
 from __future__ import annotations
 
+import datetime as dt
 import json
 from typing import Any
+
+
+def _json_default(value: Any) -> str:
+    if isinstance(value, dt.datetime):
+        return value.isoformat()
+    if isinstance(value, dt.date):
+        return value.isoformat()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
 def stitch_documents(parts: list[dict[str, Any]], *, title: str, version: str) -> tuple[dict[str, Any], list[str]]:
@@ -16,7 +25,7 @@ def stitch_documents(parts: list[dict[str, Any]], *, title: str, version: str) -
     seen_ids: set[str] = set()
     servers: list[Any] = []
     for part in parts:
-        copied = json.loads(json.dumps(part, ensure_ascii=False))
+        copied = json.loads(json.dumps(part, ensure_ascii=False, default=_json_default))
         rename = _schema_renames(copied, schemas, shape_owner, notes)
         _apply_renames(copied, rename, "#/components/schemas/")
         response_rename = _response_renames(copied, responses, response_owner, notes)

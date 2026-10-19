@@ -6,7 +6,7 @@ import re
 from openapi_from_spec.models import Gap, IRField, Operation, Segment
 from openapi_from_spec.naming import kebab, parse_target
 from openapi_from_spec.segment import _match_method
-from openapi_from_spec.tables import rows_to_fields
+from openapi_from_spec.tables import is_header, rows_to_fields, split_columns
 
 _SECTIONS = (
     ("параметры запроса", "request"),
@@ -23,13 +23,35 @@ _SECTIONS = (
 
 
 def _section_kind(line: str) -> str | None:
-    folded = re.sub(r"\s+", " ", line.strip().lower()).rstrip(":")
-    if not folded or len(line.strip()) > 80:
+    folded = line.strip().lower().replace("*", "").replace("_", "")
+    folded = re.sub(r"\s+", " ", folded).strip().rstrip(":")
+    if not folded or len(folded) > 80:
         return None
     for prefix, kind in _SECTIONS:
         if folded == prefix or folded.startswith(prefix + " "):
             return kind
+    if folded.startswith("пример ") and "ответ" in folded:
+        return "example_response"
+    if folded.startswith("пример ") and "запрос" in folded:
+        return "example_request"
     return None
+
+
+def _typed_table_lines(text: str) -> list[str]:
+    picked: list[str] = []
+    active = False
+    for line in text.splitlines():
+        if "|" not in line:
+            active = False
+            continue
+        cells = split_columns(line)
+        if is_header(cells):
+            active = True
+            picked.append(line)
+            continue
+        if active:
+            picked.append(line)
+    return picked
 
 
 def _decode_json(text: str) -> object | None:
@@ -168,6 +190,14 @@ def extract_segment(segment: Segment) -> Operation:
             if item.name in query:
                 item.examples = list(query[item.name])
             fields.append(item)
+    if not any(item.tz_type for item in fields):
+        hint = "response" if method == "get" else "body" if method in {"post", "put", "patch"} else "request"
+        for item in rows_to_fields(_typed_table_lines(segment.text), hint):
+            item.location = _place(hint, method, item, query, path_names)
+            if item.name in query:
+                item.examples = list(query[item.name])
+            fields.append(item)
+
     for name, values in query.items():
         if any(item.name == name for item in fields):
             continue

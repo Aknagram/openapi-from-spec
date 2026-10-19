@@ -20,7 +20,9 @@ def split_columns(line: str) -> list[str]:
 
 def column_kind(cell: str) -> str | None:
     name = re.sub(r"\s+", " ", cell.strip().lower())
-    if "тип" in name:
+    if "тип" in name or name == "type":
+        if ":" in name or len(name) > 30:
+            return None
         return "type"
     if "длин" in name:
         return "len"
@@ -34,7 +36,9 @@ def column_kind(cell: str) -> str | None:
 
 
 def is_header(cells: list[str]) -> bool:
-    return any(column_kind(cell) == "type" for cell in cells)
+    kinds = [column_kind(cell) for cell in cells]
+    named = [kind for kind in kinds if kind]
+    return "type" in named and len(named) >= 2
 
 
 def parse_required(cell: str) -> bool | None:
@@ -132,7 +136,7 @@ def rows_to_fields(lines: list[str], location: str) -> list[IRField]:
             continue
         used = index or guess_index(len(cells))
         depth, name = parse_name(cell(cells, used, "name"))
-        if not name or column_kind(name) == "name":
+        if not name or name.lower() in {"параметр", "parameter", "название", "наименование"}:
             continue
         required = parse_required(cell(cells, used, "required")) if "required" in used else None
         pending.append(

@@ -316,6 +316,10 @@ def find_segments(text: str) -> list[Segment]:
         if anchor.kind == "inline":
             while line_no - 1 > previous and lines[line_no - 1].text.strip():
                 line_no -= 1
+        elif anchor.kind == "method":
+            preamble = _model_block_start(lines, anchor.line, previous)
+            if preamble is not None:
+                line_no = preamble
         starts.append(line_no)
 
     segments: list[Segment] = []
@@ -328,6 +332,7 @@ def find_segments(text: str) -> list[Segment]:
         end = lines[end_line - 1].end
         chunk = text[start:end]
         raw_name, explicit_path, query = parse_target(anchor.token)
+        raw_name, explicit_path = _template_numeric_tail(raw_name, explicit_path)
         title = lines[anchor.line].text.strip()
         if anchor.kind == "title":
             title = re.sub(r"^#{1,6}\s+", "", title)
@@ -345,7 +350,44 @@ def find_segments(text: str) -> list[Segment]:
                 anchor=anchor.kind,
             )
         )
-    return _prefer_longer(segments)
+    return _drop_preamble_titles(_prefer_longer(segments))
+
+
+def _model_block_start(lines: list[_Line], method_line: int, previous: int) -> int | None:
+    """Начало описания метода выше строки запроса: «Создать модель …»."""
+    found: int | None = None
+    for cursor in range(previous + 1, method_line):
+        if re.match(r"^\*\*Создать модель\b", lines[cursor].text.strip(), re.IGNORECASE):
+            found = cursor
+    return found
+
+
+def _template_numeric_tail(raw_name: str, explicit_path: str | None) -> tuple[str, str | None]:
+    if not explicit_path:
+        return raw_name, explicit_path
+    pieces = [piece for piece in explicit_path.split("/") if piece]
+    if len(pieces) < 2 or not pieces[-1].isdigit():
+        return raw_name, explicit_path
+    pieces[-1] = "{id}"
+    return pieces[-2], "/" + "/".join(pieces)
+
+
+def _drop_preamble_titles(segments: list[Segment]) -> list[Segment]:
+    if not any(segment.http_method for segment in segments):
+        return segments
+    kept: list[Segment] = []
+    for segment in segments:
+        if segment.anchor == "title" and not segment.http_method and not _has_method_body(segment.text):
+            continue
+        kept.append(segment)
+    return kept
+
+
+def _has_method_body(text: str) -> bool:
+    folded = text.lower()
+    if any(key in folded for key in ("параметры запроса", "параметры ответа", "тело запроса", "входные параметры")):
+        return True
+    return any(_is_mapping_header(line) for line in text.splitlines())
 
 
 def _prefer_longer(segments: list[Segment]) -> list[Segment]:

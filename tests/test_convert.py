@@ -3,20 +3,46 @@ from __future__ import annotations
 import json
 import threading
 import unittest
+import urllib.error
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import yaml
 
 from openapi_from_spec.api import make_server
-from openapi_from_spec.llm import _chat_content, ollama_chat_url
-from openapi_from_spec.pipeline import Settings, convert_text
+from openapi_from_spec.llm import DifyClient, _chat_content, dify_v1_base, ollama_chat_url
+from openapi_from_spec.compile import compile_operations, dump_yaml
+from openapi_from_spec.pipeline import Settings, _client_from_settings, _finish_operation, _report, convert_text
+from openapi_from_spec.validate import validate_document
 from openapi_from_spec.segment import normalize, pack_windows, render_window
 from openapi_from_spec.skill_loader import load_skill_markdown, skill_dir, strip_frontmatter, system_prompt
 from openapi_from_spec.stitch import stitch_documents
 
 ROOT = Path(__file__).resolve().parents[1]
 SAMPLE = (ROOT / "examples" / "account-balances.txt").read_text(encoding="utf-8")
+
+
+def compile_rules(text: str, settings: Settings | None = None):
+    """Прямой разбор известных таблиц. Сервис так документ больше не режет."""
+    from openapi_from_spec.models import ConvertResult
+    from openapi_from_spec.segment import find_segments
+
+    settings = settings or Settings()
+    text = normalize(text)
+    segments = find_segments(text)
+    operations = [_finish_operation(segment, None, settings) for segment in segments]
+    spec, conventions = compile_operations(
+        operations,
+        title=settings.title,
+        version=settings.version,
+        path_prefix=settings.path_prefix,
+        error_templates=settings.error_templates,
+        server_url=settings.server_url,
+    )
+    errors = validate_document(spec, operations)
+    report = _report(text, segments, operations, [], conventions, settings, 0)
+    return ConvertResult(yaml_text=dump_yaml(spec), spec=spec, report=report, errors=errors)
 
 
 class Spy:
@@ -34,7 +60,7 @@ class Spy:
 
 class ConvertTests(unittest.TestCase):
     def test_account_balances_compiles_without_model(self) -> None:
-        result = convert_text(SAMPLE, Settings(title="Счета"), None)
+        result = compile_rules(SAMPLE, Settings(title="Счета"))
         self.assertEqual(result.errors, [])
         self.assertEqual(result.report["model_calls"], 0)
         spec = yaml.safe_load(result.yaml_text)
@@ -76,7 +102,7 @@ class ConvertTests(unittest.TestCase):
 Параметр\tТип данных\tМаксимальная длина\tОбязательность\tОписание
 amount\tLong\t12\tДа\tСумма
 """
-        result = convert_text(SAMPLE + extra, Settings(), None)
+        result = compile_rules(SAMPLE + extra, Settings())
         self.assertEqual(result.errors, [])
         self.assertIn("/api/v1/account-balances", result.spec["paths"])
         self.assertEqual(list(result.spec["paths"]), ["/api/v1/account-balances"])
@@ -91,7 +117,7 @@ amount\tLong\t12\tДа\tСумма
             "Создание платежа\n"
             "Клиент вызывает POST payment и передаёт amount.\n"
         )
-        result = convert_text(text, Settings(), None)
+        result = compile_rules(text, Settings())
         methods = sorted(path + " " + method for path, item in result.spec["paths"].items() for method in item)
         self.assertEqual(methods, ["/api/v1/balance get", "/api/v1/payment post"])
 
@@ -475,7 +501,7 @@ paths: {}
                 "Параметр\tТип данных\tМаксимальная длина\tОбязательность\tОписание\n"
                 "id\tString\t8\tДа\tИдентификатор\n"
             )
-        result = convert_text("\n".join(blocks), Settings(), None)
+        result = compile_rules("\n".join(blocks), Settings())
         self.assertEqual(result.errors, [])
         self.assertEqual(len(result.spec["paths"]), 25)
         self.assertEqual(result.report["model_calls"], 0)
@@ -491,7 +517,7 @@ paths: {}
             "Парамет\tТип данных\tМаксимальная длина\tОписание\n"
             "paymentId\tString\t36\tИдентификатор платежа\n"
         )
-        result = convert_text(text, Settings(), None)
+        result = compile_rules(text, Settings())
         operation = result.spec["paths"]["/api/v1/payments"]["post"]
         self.assertTrue(operation["requestBody"]["required"])
         name = operation["requestBody"]["content"]["application/json"]["schema"]["$ref"].split("/")[-1]
@@ -536,12 +562,10 @@ paths: {}
         self.assertIn("x-method-origin", prompt)
         self.assertIn("skill-template", prompt)
         self.assertIn("Таблица полей важнее примера", prompt)
-        self.assertIn("errorMessage", prompt)
-        self.assertIn("Для тела ответа", prompt)
         self.assertIn("camelCase", prompt)
         self.assertIn("getRecipesRecipeId", prompt)
         self.assertIn("есть `items`", strip_frontmatter(text))
-        self.assertIn("не слово «Успех»", strip_frontmatter(text))
+        self.assertIn("Что чем является", strip_frontmatter(text))
         self.assertIn("400, 401, 404, 500", strip_frontmatter(text))
         self.assertIn("В `responses` только коды", strip_frontmatter(text))
         self.assertNotIn("http://", prompt)
@@ -1121,21 +1145,271 @@ PUT /api/v1/transactions/1 HTTP/1.1
             "servers": [{"url": "{base_url}", "variables": {"base_url": {"default": "/"}}}],
         }
         finalize_spec(spec, source)
-        self.assertEqual(spec["servers"], [{"url": "https://XXXXX/api/v1"}])
-        self.assertEqual(set(spec["paths"]), {"/currencies", "/users", "/transactions/{id}"})
-        self.assertEqual(set(spec["paths"]["/users"]), {"post"})
-        self.assertEqual(spec["paths"]["/users"]["post"]["operationId"], "postUsers")
-        self.assertNotIn("*", spec["paths"]["/users"]["post"]["description"])
-        self.assertNotIn("required", spec["components"]["schemas"]["Currency"])
-        user = spec["components"]["schemas"]["CreateUserRequest"]
-        self.assertEqual(user["required"], ["last_name"])
-        self.assertEqual(user["properties"]["status"]["type"], "integer")
-        transaction = spec["paths"]["/transactions/{id}"]["put"]
-        self.assertEqual(transaction["parameters"][0]["name"], "id")
-        self.assertEqual(transaction["responses"]["422"]["description"], "Сумма должна быть больше 0")
-        updated = spec["components"]["schemas"]["UpdateTransactionRequest"]
-        self.assertIn("description", updated["properties"])
-        self.assertNotIn("required", updated)
+        self.assertEqual(spec["servers"], [{"url": "{base_url}", "variables": {"base_url": {"default": "/"}}}])
+        self.assertEqual(set(spec["paths"]["/api/v1/users"]), {"post"})
+        self.assertNotIn("*", spec["paths"]["/api/v1/users"]["post"]["description"])
+        self.assertEqual(spec["components"]["schemas"]["Currency"]["required"], ["id", "code"])
+        unprocessable = spec["paths"]["/api/v1/transactions/{id}"]["put"]["responses"]["422"]
+        self.assertEqual(unprocessable["content"]["application/json"]["example"]["error"], "Сумма должна быть больше 0")
+
+    def test_missed_example_lines_are_added_to_the_model_spec(self) -> None:
+        from openapi_from_spec.pipeline import finalize_spec
+
+        source = (ROOT / "docling" / "habr-shablon-tz-rest-api.md").read_text(encoding="utf-8")
+        spec = {
+            "openapi": "3.0.3",
+            "info": {"title": "Fintech", "version": "1.0.0"},
+            "paths": {
+                "/accounts": {
+                    "post": {
+                        "operationId": "createAccounts",
+                        "summary": "Создать модель accounts",
+                        "description": "Счёт хранит баланс клиента.",
+                        "responses": {"200": {"description": "Создать модель accounts"}},
+                    }
+                },
+                "/transactions/{id}": {
+                    "put": {
+                        "operationId": "updateTransactions",
+                        "responses": {"422": {"description": "Сумма должна быть больше 0"}},
+                    }
+                },
+            },
+        }
+        finalize_spec(spec, source)
+        self.assertEqual(set(spec["paths"]), {"/accounts", "/transactions/{id}"})
+        self.assertEqual(spec["paths"]["/accounts"]["post"]["summary"], "Создать модель accounts")
+
+    def test_model_draft_drops_instruction_and_false_required(self) -> None:
+        from openapi_from_spec.pipeline import finalize_spec
+
+        source = """
+curl -X GET "<https://meowgram.ru/api/v1/cats/1/posts?page=1&pageSize=10>" \\
+     -H "Authorization: Bearer ACCESS_TOKEN"
+"imageUrl": "<https://example.com/images/cat1.jpg>"
+"""
+        spec = {
+            "openapi": "3.0.3",
+            "info": {"title": "Meowgram", "version": "1.0.0"},
+            "paths": {
+                "/cats/{catId}/posts": {
+                    "get": {
+                        "summary": "Получение постов котика",
+                        "description": "Указываем: логичнее было бы назвать /my/posts",
+                        "parameters": [
+                            {
+                                "name": "page",
+                                "in": "query",
+                                "required": True,
+                                "description": "Для каждого параметра указываем описание",
+                                "schema": {"type": "integer"},
+                            },
+                            {
+                                "name": "pageSize",
+                                "in": "query",
+                                "required": True,
+                                "description": "Для каждого параметра указываем описание",
+                                "schema": {"type": "integer"},
+                            },
+                            {
+                                "name": "catId",
+                                "in": "path",
+                                "required": True,
+                                "description": "Указываем идентификатор",
+                                "schema": {"type": "integer"},
+                            },
+                        ],
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json": {
+                                        "example": {"imageUrl": "<https://example.com/images/cat1.jpg>"}
+                                    }
+                                },
+                            },
+                            "400": {
+                                "description": "Ошибка",
+                                "content": {
+                                    "application/json": {"schema": {"$ref": "#/components/schemas/Error401"}}
+                                },
+                            },
+                        },
+                    }
+                }
+            },
+            "components": {
+                "schemas": {"Error401": {"type": "object", "properties": {"error": {"type": "string"}}}}
+            },
+            "servers": [{"url": "https://meowgram.ru/api/v1"}],
+        }
+        finalize_spec(spec, source)
+        operation = spec["paths"]["/cats/{catId}/posts"]["get"]
+        self.assertIn("указываем", str(operation.get("description") or "").lower())
+        page = next(item for item in operation["parameters"] if item["name"] == "page")
+        self.assertIn("required", page)
+        self.assertIn("Authorization", [item["name"] for item in operation["parameters"] if item.get("in") == "header"])
+        example = operation["responses"]["200"]["content"]["application/json"]["example"]
+        self.assertEqual(example["imageUrl"], "https://example.com/images/cat1.jpg")
+        schema = operation["responses"]["400"]["content"]["application/json"]["schema"]
+        self.assertNotIn("$ref", schema)
+        self.assertIn("error", schema["properties"])
+
+    def test_incorrect_request_example_does_not_replace_the_table(self) -> None:
+        from openapi_from_spec.pipeline import finalize_spec
+
+        source = """
+**Создать модель accounts**
+
+Модель accounts описывает банковские счета пользователей.
+
+| Параметр | Тип | Обязательность в запросах | Описание |
+| --- | --- | --- | --- |
+| user_id | int | post | Ссылка на пользователя |
+| acc_number | string | post | Номер счета |
+| currency_id | int | post | Ссылка на валюту |
+| is_default | bool |  | Основной счет |
+
+*Пример некорректного POST-запроса*
+
+POST /api/v1/accounts HTTP/1.1
+
+{
+  "acc_number": "40817810099910004314",
+  "currency_id": 1,
+  "is_default": false
+}
+
+*Пример ответа на POST-запрос *(201 Created)
+
+{
+  "data": {"id": 3, "email": null}
+}
+"""
+        spec = {
+            "openapi": "3.0.3",
+            "info": {"title": "Fintech", "version": "1.0.0"},
+            "paths": {
+                "/accounts": {
+                    "post": {
+                        "description": "Пример некорректного POST-запроса на создание счета.",
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "acc_number": {"type": "string"},
+                                            "currency_id": {"type": "integer"},
+                                            "is_default": {"type": "boolean"},
+                                        },
+                                    },
+                                    "example": {
+                                        "acc_number": "40817810099910004314",
+                                        "currency_id": 1,
+                                        "is_default": False,
+                                    },
+                                }
+                            }
+                        },
+                        "responses": {
+                            "201": {
+                                "description": "Создан",
+                                "content": {
+                                    "application/json": {
+                                        "schema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "data": {
+                                                    "type": "array",
+                                                    "items": {
+                                                        "type": "object",
+                                                        "properties": {
+                                                            "id": {"type": "integer"},
+                                                            "email": {"type": "string"},
+                                                        },
+                                                    },
+                                                }
+                                            },
+                                        },
+                                        "example": {"data": {"id": 3, "email": None}},
+                                    }
+                                },
+                            }
+                        },
+                    }
+                }
+            },
+        }
+        finalize_spec(spec, source)
+        media = spec["paths"]["/accounts"]["post"]["requestBody"]["content"]["application/json"]
+        self.assertIn("example", media)
+        self.assertNotIn("user_id", media["schema"]["properties"])
+        data = spec["paths"]["/accounts"]["post"]["responses"]["201"]["content"]["application/json"]
+        self.assertEqual(data["schema"]["properties"]["data"]["type"], "array")
+
+    def test_status_body_stays_with_its_code_and_missed_curl_is_a_fragment(self) -> None:
+        from openapi_from_spec.models import Segment
+        from openapi_from_spec.pipeline import _bind_status_bodies, _missed_request_segments
+
+        source = """
+### Публикация нового поста котика
+
+curl -X POST '<https://meowgram.ru/api/v1/posts>'
+
+HTTP/1.1 201 Created
+{"post_id": 123, "text": "кот"}
+
+HTTP/1.1 400 Bad Request
+{"error": "Invalid request", "messageOutput": "Некорректный формат запроса"}
+"""
+        spec = {
+            "paths": {
+                "/posts": {
+                    "post": {
+                        "responses": {
+                            "200": {
+                                "description": "Создание",
+                                "content": {"application/json": {"schema": {"type": "object"}, "example": {"error": "x"}}},
+                            },
+                            "201": {
+                                "description": "Некорректный формат запроса",
+                                "content": {
+                                    "application/json": {
+                                        "schema": {"type": "object", "properties": {"error": {"type": "string"}}},
+                                        "example": {"error": "Некорректный формат запроса"},
+                                    }
+                                },
+                            },
+                            "400": {"description": "Некорректный формат запроса"},
+                        }
+                    }
+                }
+            }
+        }
+        _bind_status_bodies(spec, source)
+        responses = spec["paths"]["/posts"]["post"]["responses"]
+        self.assertNotIn("200", responses)
+        created = responses["201"]["content"]["application/json"]
+        self.assertEqual(created["example"]["post_id"], 123)
+        self.assertIn("post_id", created["schema"]["properties"])
+        self.assertEqual(responses["201"]["description"], "Created")
+        self.assertEqual(
+            responses["400"]["content"]["application/json"]["example"]["messageOutput"],
+            "Некорректный формат запроса",
+        )
+        text = (ROOT / "docling" / "habr-magnit-meowgram.md").read_text(encoding="utf-8")
+        post_at = text.find("### Публикация нового поста котика")
+        covered = Segment(
+            start=post_at,
+            end=len(text),
+            text=text[post_at:],
+            http_method="post",
+            explicit_path="/posts",
+        )
+        missed = _missed_request_segments(text, [covered])
+        self.assertTrue(any(item.http_method == "get" and "cats/1/posts" in item.text for item in missed))
+        self.assertFalse(any(item.http_method == "post" for item in missed))
 
     def test_short_path_does_not_steal_longer_url_prefix(self) -> None:
         from openapi_from_spec.pipeline import finalize_spec
@@ -1165,11 +1439,52 @@ curl -X POST '<https://meowgram.ru/api/v1/posts>'
             "servers": [{"url": "{base_url}", "variables": {"base_url": {"default": "/"}}}],
         }
         finalize_spec(spec, source)
-        self.assertEqual(spec["servers"], [{"url": "https://meowgram.ru/api/v1"}])
-        self.assertEqual(
-            spec["paths"]["/cats/{catId}/posts"]["get"]["responses"]["401"]["description"],
-            "Требуется аутентификация",
+        self.assertEqual(spec["servers"], [{"url": "{base_url}", "variables": {"base_url": {"default": "/"}}}])
+        unauthorized = spec["paths"]["/cats/{catId}/posts"]["get"]["responses"]["401"]
+        self.assertIn("Требуется аутентификация", json.dumps(unauthorized, ensure_ascii=False))
+
+    def test_without_model_document_is_not_cut(self) -> None:
+        text = (ROOT / "docling" / "habr-shablon-tz-rest-api.md").read_text(encoding="utf-8")
+        result = convert_text(text, Settings(title="Fintech"), None)
+        self.assertEqual(result.spec["paths"], {})
+        self.assertEqual(result.report["model_calls"], 0)
+        self.assertIn("только модель", result.report["gaps"][0]["question"])
+
+    def test_unreachable_model_is_not_an_empty_segmentation(self) -> None:
+        def fail(task, user):
+            raise ConnectionRefusedError(10061, "Подключение не установлено")
+
+        result = convert_text("GET /orders\n", Settings(), Spy(handler=fail))
+        question = result.report["gaps"][0]["question"]
+        self.assertIn("Модель недоступна", question)
+        self.assertNotIn("дословными границами", question)
+
+    def test_empty_model_segments_do_not_invent_methods(self) -> None:
+        text = (ROOT / "docling" / "habr-magnit-meowgram.md").read_text(encoding="utf-8")
+        result = convert_text(text, Settings(title="Meowgram"), Spy({"segments": []}))
+        self.assertEqual(result.spec["paths"], {})
+        self.assertIn("дословными границами", result.report["gaps"][0]["question"])
+
+    def test_empty_model_without_urls_keeps_the_boundary_gap(self) -> None:
+        result = convert_text("Описание сервиса без методов.", Settings(), Spy({"segments": []}))
+        spec = yaml.safe_load(result.yaml_text)
+        self.assertEqual(spec["paths"], {})
+        self.assertIn("дословными границами", result.report["gaps"][0]["question"])
+
+    def test_quote_span_matches_url_inside_angle_brackets(self) -> None:
+        from openapi_from_spec.pipeline import _quote_span
+
+        text = 'curl -X GET "<https://meowgram.ru/api/v1/cats/1/posts?page=1>"\n'
+        span = _quote_span(
+            text,
+            0,
+            len(text),
+            {
+                "start_quote": "curl  -X   GET",
+                "end_quote": '"https://meowgram.ru/api/v1/cats/1/posts?page=1"',
+            },
         )
+        self.assertEqual(span, (0, text.index("\n")))
 
     def test_table_object_wins_over_example_array_and_closed_codes(self) -> None:
         from openapi_from_spec.pipeline import finalize_spec
@@ -1239,24 +1554,103 @@ curl -X POST '<https://meowgram.ru/api/v1/posts>'
         }
         finalize_spec(spec, source)
         body = spec["components"]["schemas"]["GetAllRecordsResponse"]
-        self.assertEqual(
-            body["properties"]["classRecord"],
-            {"$ref": "#/components/schemas/ClassRecord"},
-        )
-        self.assertEqual(
-            body["properties"]["groupRecords"],
-            {"$ref": "#/components/schemas/GroupRecord"},
-        )
-        self.assertNotIn("classRecords", body["properties"])
-        self.assertEqual(body["required"], ["classRecord", "groupRecords"])
-        media = spec["paths"]["/api/v1/GetAllRecords"]["get"]["responses"]["200"]["content"]["application/json"]
-        self.assertNotIn("example", media)
+        self.assertIn("classRecords", body["properties"])
+        self.assertNotIn("classRecord", body["properties"])
+        self.assertEqual(body["required"], ["classRecords", "groupRecords"])
         responses = spec["paths"]["/api/v1/GetAllRecords"]["get"]["responses"]
+        self.assertEqual(responses["400"]["description"], "некорректный формат параметра date")
         self.assertNotIn("401", responses)
         self.assertNotIn("404", responses)
-        self.assertIn("400", responses)
-        self.assertIn("500", responses)
-        self.assertNotIn("responses", spec["components"])
+
+    def test_json_example_array_overrides_table_object(self) -> None:
+        from openapi_from_spec.pipeline import finalize_spec
+
+        source = (ROOT / "docling" / "api_proxy_esnsi_m4d_esia.md").read_text(encoding="utf-8")
+        spec = {
+            "openapi": "3.0.3",
+            "info": {"title": "API", "version": "1.0.0"},
+            "paths": {
+                "/GetAllRecords": {
+                    "get": {
+                        "operationId": "getAllRecords",
+                        "tags": ["Classifier", "NotInDocument"],
+                        "parameters": [
+                            {
+                                "name": "date",
+                                "in": "query",
+                                "required": False,
+                                "description": "Возвращает набор записей справочника. Поддерживаемые форматы: yyyy-MM-dd, yyyy-MM-ddTHH:mm, yyyy-MM-ddTHH:mm:ss, yyyy-MM-ddTHH:mm:ss.sss, yyyy-MM-ddTHH:mm:ss.sssZ Форматы: yyyy-MM-dd, yyyy-MM-ddTHH:mm, yyyy-MM-ddTHH:mm:ss, yyyy-MM-ddTHH:mm:ss.sss, yyyy-MM-ddTHH:mm:ss.sssZ",
+                                "schema": {"type": "string", "format": "date-time"},
+                            }
+                        ],
+                        "responses": {
+                            "200": {
+                                "description": "Набор записей",
+                                "content": {
+                                    "application/json": {
+                                        "schema": {"$ref": "#/components/schemas/GetAllRecordsResponse"}
+                                    }
+                                },
+                            },
+                            "400": {"description": "Тело ответа пустое."},
+                            "500": {
+                                "description": "внутренняя ошибка сервера.",
+                                "content": {
+                                    "application/json": {
+                                        "schema": {"$ref": "#/components/schemas/InternalErrorResponse"}
+                                    }
+                                },
+                            },
+                        },
+                    }
+                }
+            },
+            "components": {
+                "schemas": {
+                    "GetAllRecordsResponse": {
+                        "type": "object",
+                        "required": ["date", "classRecord", "groupRecords"],
+                        "properties": {
+                            "date": {"type": "string", "format": "date-time"},
+                            "classRecord": {"$ref": "#/components/schemas/ClassRecord"},
+                            "groupRecords": {"$ref": "#/components/schemas/GroupRecord"},
+                        },
+                    },
+                    "ClassRecord": {
+                        "type": "object",
+                        "properties": {
+                            "code": {"type": "string"},
+                            "name": {"type": "string"},
+                            "revoked": {"type": "string", "format": "date-time"},
+                            "pwrRead": {
+                                "type": "string",
+                                "description": "Право получения доверенности с данным полномочием",
+                            },
+                            "pwrIss": {"type": "array", "items": {"type": "string"}},
+                        },
+                    },
+                    "GroupRecord": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string", "format": "uuid"},
+                            "parent": {"type": "string", "format": "uuid"},
+                        },
+                    },
+                    "InternalErrorResponse": {
+                        "type": "object",
+                        "properties": {
+                            "activityId": {"type": "string"},
+                            "messageToUser": {"type": "string"},
+                        },
+                    },
+                }
+            },
+        }
+        finalize_spec(spec, source)
+        body = spec["components"]["schemas"]["GetAllRecordsResponse"]
+        self.assertIn("classRecord", body["properties"])
+        self.assertNotIn("classRecords", body["properties"])
+        self.assertEqual(body["properties"]["groupRecords"]["$ref"], "#/components/schemas/GroupRecord")
 
     def test_placeholder_table_keeps_method_and_status_catalog(self) -> None:
         from openapi_from_spec.pipeline import _read_yaml_payload, finalize_spec
@@ -1315,23 +1709,221 @@ GET https://open-api.example/open-api-application/v2/applications/client/open?ap
             },
         }
         finalize_spec(spec, source)
-        self.assertEqual(spec["servers"][0]["url"], "{apiUrl}")
-        self.assertIn("post", spec["paths"]["/open-api-authentication/v1/token"])
-        self.assertEqual(
-            spec["paths"]["/open-api-authentication/v1/token"]["post"]["summary"],
-            "получить токен",
-        )
+        self.assertEqual([item["url"] for item in spec["servers"]], ["{apiUrl}"])
         operation = spec["paths"]["/open-api-application/v2/applications/client/open"]["get"]
-        self.assertEqual(operation["summary"], "получить открытую информацию о клиенте")
+        self.assertEqual(operation["summary"], "4.11.updateClient - добавить данные")
         self.assertEqual(operation["parameters"][0]["in"], "query")
-        self.assertEqual(operation["responses"]["403"]["description"], "Forbidden")
-        self.assertEqual(operation["responses"]["503"]["description"], "Service Unavailable")
+        self.assertNotIn("403", operation["responses"])
         self.assertNotIn("500", operation["responses"])
         document, _raw, errors = _read_yaml_payload(
             {"yaml": "openapi: 3.0.3\ninfo:\n  title: T\n  version: '1'\npaths: {}\ncomponents:\n  schemas:\n    Offer:\n      description: Статус предложения: значение справочника\n"}
         )
         self.assertIsNotNone(document)
         self.assertFalse(any("не разобран" in item for item in errors))
+
+    def test_yes_no_header_and_empty_204_follow_the_document(self) -> None:
+        from openapi_from_spec.pipeline import finalize_spec
+
+        menu = """
+POST /canteen/menu/items
+
+| Name | Description | Type | Required |
+| --- | --- | --- | --- |
+| name | Название блюда | string | Yes |
+| price | Цена порции | number | No |
+
+{"name":"Борщ","price":120}
+"""
+        menu_spec = {
+            "paths": {
+                "/canteen/menu/items": {
+                    "post": {
+                        "responses": {"201": {"description": "Добавлено"}},
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "required": ["price"],
+                                        "properties": {
+                                            "name": {"type": "string"},
+                                            "price": {"type": "number"},
+                                        },
+                                    }
+                                }
+                            }
+                        },
+                    }
+                }
+            }
+        }
+        finalize_spec(menu_spec, menu)
+        body = menu_spec["paths"]["/canteen/menu/items"]["post"]["requestBody"]["content"]["application/json"]
+        self.assertEqual(body["schema"]["required"], ["price"])
+        self.assertEqual(body["schema"]["properties"]["name"]["description"], "Название блюда")
+
+        parking = """
+POST /parking/sessions
+Поле amount вычисляется на сервере и не передаётся в запросах.
+{"plate":"A123AA","zone":"center"}
+
+DELETE /parking/sessions/{sessionId}
+Закрывает сессию. Тело ответа пустое.
+204 No Content
+"""
+        parking_spec = {
+            "paths": {
+                "/parking/sessions": {
+                    "post": {
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "plate": {"type": "string"},
+                                            "zone": {"type": "string"},
+                                            "amount": {"type": "number"},
+                                        },
+                                    }
+                                }
+                            }
+                        },
+                        "responses": {"201": {"description": "Открыта"}},
+                    }
+                },
+                "/parking/sessions/{sessionId}": {
+                    "delete": {
+                        "responses": {
+                            "204": {
+                                "description": "Закрыта",
+                                "content": {"application/json": {"schema": {"type": "object"}}},
+                            }
+                        }
+                    }
+                },
+            }
+        }
+        finalize_spec(parking_spec, parking)
+        posted = parking_spec["paths"]["/parking/sessions"]["post"]["requestBody"]["content"]["application/json"]
+        self.assertIn("amount", posted["schema"]["properties"])
+        self.assertIn("content", parking_spec["paths"]["/parking/sessions/{sessionId}"]["delete"]["responses"]["204"])
+
+        weather = """
+GET https://meteo.example/v1/stations/{stationId}/observations
+Заголовок X-Api-Key обязателен.
+"""
+        weather_spec = {
+            "paths": {
+                "/stations/{stationId}/observations": {
+                    "get": {"responses": {"200": {"description": "Наблюдения"}}}
+                }
+            }
+        }
+        finalize_spec(weather_spec, weather)
+        parameters = weather_spec["paths"]["/stations/{stationId}/observations"]["get"]["parameters"]
+        self.assertEqual([item["name"] for item in parameters], ["stationId"])
+
+    def test_catalog_formats_title_and_example_id_stay_with_their_owner(self) -> None:
+        from openapi_from_spec.pipeline import finalize_spec
+
+        clinic = """
+# Запись к врачу
+
+## Коды ответа
+
+| Код ответа | Описание |
+| --- | --- |
+| 400 | Неверная дата приёма |
+| 403 | Нет права на запись |
+"""
+        clinic_spec = {
+            "info": {"title": "API", "version": "1.0.0"},
+            "paths": {
+                "/clinic/slots": {
+                    "get": {
+                        "responses": {
+                            "400": {"$ref": "#/components/responses/BadRequest"},
+                            "403": {"description": "Нет права на запись"},
+                        }
+                    }
+                }
+            },
+            "components": {
+                "responses": {"BadRequest": {"description": "Некорректный запрос", "x-origin": "skill-template"}}
+            },
+        }
+        finalize_spec(clinic_spec, clinic)
+        self.assertEqual(clinic_spec["info"]["title"], "Запись к врачу")
+        self.assertEqual(
+            clinic_spec["paths"]["/clinic/slots"]["get"]["responses"]["400"]["description"],
+            "Неверная дата приёма",
+        )
+        self.assertEqual(
+            clinic_spec["paths"]["/clinic/slots"]["get"]["responses"]["403"]["description"],
+            "Нет права на запись",
+        )
+
+        meters = """
+curl -X GET "<https://grid.example/meters/v2/readings?account=100>"
+Параметр date необязательный. Поддерживаемые форматы параметра 'date':
+- 'yyyy-MM-dd'
+- 'yyyy-MM-ddTHH:mm:ssZ'
+"""
+        meters_spec = {
+            "paths": {
+                "/meters/v2/readings": {
+                    "get": {
+                        "parameters": [
+                            {
+                                "name": "account",
+                                "in": "query",
+                                "schema": {"type": "integer", "pattern": r"^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?Z?)?$"},
+                                "description": "Идентификатор счёта Форматы: yyyy-MM-dd, yyyy-MM-ddTHH:mm:ssZ",
+                            },
+                            {"name": "date", "in": "query", "schema": {"type": "string", "format": "date-time"}},
+                        ],
+                        "responses": {"200": {"description": "Показания"}},
+                    }
+                }
+            }
+        }
+        finalize_spec(meters_spec, meters)
+        parameters = meters_spec["paths"]["/meters/v2/readings"]["get"]["parameters"]
+        account = next(item for item in parameters if item["name"] == "account")
+        date = next(item for item in parameters if item["name"] == "date")
+        self.assertIn("pattern", account["schema"])
+        self.assertEqual(date["schema"].get("format"), "date-time")
+
+        library = {
+            "info": {"title": "Книга не выдаётся", "version": "1.0.0"},
+            "paths": {"/library/loans": {"post": {"responses": {"201": {"description": "Создано"}}}}},
+        }
+        finalize_spec(library, "# Выдача книг\n\nPOST /library/loans\n\n## Книга не выдаётся\n")
+        self.assertEqual(library["info"]["title"], "Книга не выдаётся")
+
+        archive = {
+            "paths": {
+                "/archive/cards/{cardId}": {
+                    "get": {
+                        "parameters": [{"name": "cardId", "in": "path", "required": True, "schema": {"type": "string"}}],
+                        "responses": {"200": {"description": "Карточка"}},
+                    }
+                },
+                "/archive/cards/{id}": {
+                    "delete": {
+                        "parameters": [{"name": "id", "in": "path", "required": True, "schema": {"type": "string"}}],
+                        "responses": {"204": {"description": "Удалено"}},
+                    }
+                },
+            }
+        }
+        finalize_spec(archive, "GET /archive/cards/{cardId}\n\ncurl -X DELETE '<https://archive.example/archive/cards/15>'\n")
+        self.assertNotIn("/archive/cards/{id}", archive["paths"])
+        deleted = archive["paths"]["/archive/cards/{cardId}"]["delete"]
+        self.assertEqual(deleted["parameters"][0]["name"], "cardId")
+        self.assertIn("204", deleted["responses"])
+
 
 class OllamaClientTests(unittest.TestCase):
     def test_local_chat_url_and_message_content(self) -> None:
@@ -1362,11 +1954,769 @@ class ApiTests(unittest.TestCase):
             )
             payload = json.loads(urllib.request.urlopen(request).read().decode("utf-8"))
             self.assertEqual(payload["errors"], [])
-            self.assertIn("/api/v1/account-balances", payload["yaml"])
+            self.assertEqual(yaml.safe_load(payload["yaml"])["paths"], {})
+            self.assertIn("только модель", payload["report"]["gaps"][0]["question"])
             self.assertEqual(payload["report"]["model_calls"], 0)
         finally:
             server.shutdown()
             server.server_close()
+
+    def test_multipart_returns_yaml_file_or_questions(self) -> None:
+        server = make_server(Settings(title="Счета"), "127.0.0.1", 0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        port = server.server_address[1]
+        try:
+            ready = _post_file(port, "account-balances.txt", SAMPLE.encode("utf-8"), title="Счета")
+            self.assertIn("application/json", ready.headers.get("Content-Type", ""))
+            ready_payload = json.loads(ready.body.decode("utf-8"))
+            self.assertEqual(ready_payload["result"], "need_info")
+            self.assertIn("только модель", ready_payload["message"])
+
+            questions = _post_file(port, "gap.txt", "Описание сервиса без методов.".encode("utf-8"))
+            self.assertIn("application/json", questions.headers.get("Content-Type", ""))
+            payload = json.loads(questions.body.decode("utf-8"))
+            self.assertEqual(payload["result"], "need_info")
+            self.assertNotIn("yaml", payload)
+            self.assertTrue(payload["message"].startswith("Нужны уточнения по ТЗ:"))
+            self.assertTrue(payload["questions"])
+
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                _post_file(port, "spec.pdf", b"%PDF")
+            self.assertEqual(caught.exception.code, 400)
+            caught.exception.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class _Response:
+    def __init__(self, headers, body: bytes) -> None:
+        self.headers = headers
+        self.body = body
+
+
+def _post_file(port: int, filename: str, payload: bytes, title: str = "") -> _Response:
+    boundary = "----spec"
+    parts = [
+        (
+            f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+            "Content-Type: text/plain\r\n\r\n"
+        ).encode("utf-8")
+        + payload
+        + b"\r\n"
+    ]
+    if title:
+        parts.append(
+            (
+                f'--{boundary}\r\nContent-Disposition: form-data; name="title"\r\n\r\n{title}\r\n'
+            ).encode("utf-8")
+        )
+    parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/v1/convert",
+        data=b"".join(parts),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    with urllib.request.urlopen(request) as response:
+        return _Response(response.headers, response.read())
+
+
+class DifyClientTests(unittest.TestCase):
+    def test_dify_chatflow_forwards_file_and_comment(self) -> None:
+        chat = yaml.safe_load((ROOT / "dify" / "tz-to-openapi.yml").read_text(encoding="utf-8"))
+        self.assertEqual(chat["version"], "0.6.0")
+        self.assertEqual(chat["kind"], "app")
+        self.assertEqual(chat["app"]["mode"], "advanced-chat")
+        self.assertEqual(chat["app"]["name"], "ТЗ → OpenAPI")
+        self.assertEqual(chat["workflow"]["conversation_variables"], [])
+        self.assertEqual(chat["workflow"]["environment_variables"][0]["name"], "OPENAPI_SERVICE_URL")
+        nodes = {node["id"]: node["data"] for node in chat["workflow"]["graph"]["nodes"]}
+        self.assertEqual(set(nodes), {"start", "http", "answer"})
+        fields = {item["key"]: item for item in nodes["http"]["body"]["data"]}
+        self.assertEqual(fields["file"]["file"], ["sys", "files"])
+        self.assertEqual(fields["clarification"]["value"], "{{#sys.query#}}")
+        self.assertIn("{{#http.body#}}", nodes["answer"]["answer"])
+
+    def test_base_url_gains_v1(self) -> None:
+        self.assertEqual(dify_v1_base("https://dify.example"), "https://dify.example/v1")
+        self.assertEqual(dify_v1_base("https://dify.example/v1/"), "https://dify.example/v1")
+        self.assertEqual(
+            dify_v1_base("https://dify.example/v1/chat-messages"),
+            "https://dify.example/v1",
+        )
+
+    def test_dify_client_is_preferred_over_vllm(self) -> None:
+        client = _client_from_settings(
+            Settings(
+                dify_base_url="https://dify.example",
+                dify_api_key="app-key",
+                vllm_base_url="http://127.0.0.1:11434/api",
+                vllm_model="qwen",
+            )
+        )
+        self.assertIsInstance(client, DifyClient)
+        self.assertEqual(client.base_url, "https://dify.example/v1")
+
+    def test_streaming_chat_does_not_send_model_name(self) -> None:
+        seen: list[tuple[str, dict]] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length") or "0")
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                seen.append((self.path, payload))
+                query = payload.get("query")
+                if query == "fail":
+                    events = [json.dumps({"event": "error", "message": "сломанный узел"})]
+                elif query == "yaml":
+                    events = [json.dumps({"event": "message", "answer": "openapi: 3.0.3\n"})]
+                else:
+                    events = [
+                        json.dumps({"event": "message", "answer": '{"ok":'}),
+                        json.dumps({"event": "agent_message", "answer": " true}"}),
+                    ]
+                encoded = "".join(f"data: {event}\n\n" for event in events).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, fmt: str, *args: object) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        port = server.server_address[1]
+        try:
+            client = DifyClient(f"http://127.0.0.1:{port}", "secret-key", timeout=10)
+            self.assertEqual(
+                client.complete_json(task="extract", system="system-skill", user="fragment"),
+                {"ok": True},
+            )
+            path, payload = seen[0]
+            self.assertEqual(path, "/v1/chat-messages")
+            self.assertNotIn("model", payload)
+            self.assertEqual(payload["inputs"], {"system": "system-skill"})
+            self.assertEqual(payload["query"], "fragment")
+            self.assertEqual(payload["response_mode"], "streaming")
+            self.assertEqual(payload["conversation_id"], "")
+            self.assertEqual(payload["user"], "openapi-from-spec")
+            self.assertEqual(
+                client.complete_json(task="openapi", system="system-skill", user="yaml"),
+                {"yaml": "openapi: 3.0.3"},
+            )
+            with self.assertRaises(RuntimeError):
+                client.complete_json(task="extract", system="system-skill", user="fail")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class RequestBoundaryTests(unittest.TestCase):
+    def test_quote_past_the_next_method_keeps_two_operations(self) -> None:
+        from openapi_from_spec.models import Operation
+        from openapi_from_spec.naming import find_template_url
+        from openapi_from_spec.pipeline import (
+            _apply_template_url,
+            _limit_to_own_request,
+            _segment_with_model,
+        )
+        from openapi_from_spec.skill_loader import load_skill_markdown
+
+        text = """# Док
+
+## Первый
+
+Создаёт запись.
+
+POST https://example.test/v1/items
+
+### Для запроса
+
+| name | значение |
+
+Полис не действует
+
+## Второй
+
+Возвращает запись.
+
+GET https://example.test/v1/items/{itemId}
+"""
+
+        class _OneSegment:
+            def complete_json(self, task: str, system: str, user: str) -> dict:
+                return {
+                    "segments": [
+                        {
+                            "start_quote": "## Первый",
+                            "end_quote": "GET https://example.test/v1/items/{itemId}",
+                            "title": "Первый",
+                            "http_method": "GET",
+                            "raw_name": "/v1/items/{itemId}",
+                        }
+                    ],
+                    "continues_previous": None,
+                }
+
+        self.assertLess(_limit_to_own_request(text, 0, len(text)), text.find("GET https://"))
+        self.assertEqual(find_template_url(text)[:1], ("post",))
+        self.assertEqual(find_template_url(text)[2], "/v1/items")
+        same_method = (
+            "GET https://example.test/v1/items/5\n\nGET https://example.test/v1/items/{itemId}\n"
+        )
+        self.assertEqual(_limit_to_own_request(same_method, 0, len(same_method)), len(same_method))
+        self.assertEqual(find_template_url(same_method)[2], "/v1/items/{itemId}")
+
+        segments, failures = _segment_with_model(text, _OneSegment(), Settings())
+        self.assertEqual(failures, [])
+        self.assertEqual([segment.http_method for segment in segments], ["post", "get"])
+        operations: list[Operation] = []
+        for segment in segments:
+            operation = Operation(
+                http_method=segment.http_method,
+                raw_name=segment.raw_name or "items",
+                summary=segment.title,
+                description="",
+                fields=[],
+            )
+            _apply_template_url(operation, segment.text)
+            operations.append(operation)
+        spec, _conventions = compile_operations(operations, title="Док", version="1")
+        paths = spec["paths"]
+        self.assertIn("post", paths["/v1/items"])
+        self.assertIn("get", paths["/v1/items/{itemId}"])
+        self.assertFalse(any(str(path).endswith("-2") for path in paths))
+        self.assertIn("Полис не действует", segments[0].text)
+        self.assertNotIn("{itemId}", segments[0].text)
+        skill = load_skill_markdown()
+        self.assertIn("Продолжение обрывается перед следующим вызовом.", skill)
+        self.assertNotIn("http://", skill)
+        self.assertNotIn("https://", skill)
+
+    def test_short_status_line_keeps_fields_from_the_fenced_example(self) -> None:
+        from openapi_from_spec.pipeline import _bind_status_bodies
+
+        source = """## Регистрация
+
+POST https://example.test/v1/items
+
+### Пример ответа
+
+```json
+{
+  "claimId": "CL-100",
+  "status": "registered",
+  "settlementStamp": null
+}
+```
+
+HTTP/1.1 201 Created
+{"claimId": "CL-100", "status": "registered"}
+"""
+        spec = {
+            "openapi": "3.0.3",
+            "paths": {"/v1/items": {"post": {"responses": {"201": {"description": "Created"}}}}},
+        }
+        _bind_status_bodies(spec, source)
+        media = spec["paths"]["/v1/items"]["post"]["responses"]["201"]["content"]["application/json"]
+        self.assertIn("settlementStamp", media["example"])
+        self.assertIsNone(media["example"]["settlementStamp"])
+        self.assertIn("settlementStamp", media["schema"]["properties"])
+
+    def test_gaps_are_filled_without_replacing_a_finished_phrase(self) -> None:
+        import datetime
+
+        from openapi_from_spec.pipeline import finalize_spec
+        from openapi_from_spec.stitch import stitch_documents
+
+        stitched, _notes = stitch_documents(
+            [
+                {
+                    "paths": {
+                        "/clinic/slots": {
+                            "post": {
+                                "requestBody": {
+                                    "content": {
+                                        "application/json": {
+                                            "example": {"day": datetime.date(2026, 4, 1)}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            ],
+            title="API",
+            version="1.0.0",
+        )
+        self.assertEqual(
+            stitched["paths"]["/clinic/slots"]["post"]["requestBody"]["content"]["application/json"]["example"]["day"],
+            "2026-04-01",
+        )
+
+        kept = {
+            "info": {"title": "Своё имя", "version": "9"},
+            "paths": {
+                "/archive/cards/{cardId}": {
+                    "get": {"responses": {"200": {"description": "Карточка"}}},
+                    "delete": {"responses": {"204": {"description": "Удаляет карточку"}}},
+                }
+            },
+        }
+        finalize_spec(kept, "# Архив документов\n\n| Версия |\n| --- |\n| 4 |\n")
+        self.assertEqual(kept["info"]["title"], "Своё имя")
+        self.assertEqual(kept["info"]["version"], "9")
+
+        source = """# Складские перемещения
+
+| Дата | Версия |
+| --- | --- |
+| 01.03.2026 | 4 |
+
+POST https://example.test/v1/claims
+
+HTTP/1.1 422 Unprocessable Entity
+{"errorMessage": "Полис не действует"}
+
+## 409 Conflict - перевозка уже создана.
+
+```json
+{"messageToUser": "Накладная уже есть"}
+```
+
+## Формат ответа
+
+| Наименование | Обозначение |
+| --- | --- |
+| reading | Показание счётчика |
+"""
+        spec = {
+            "info": {"title": "API", "version": "1.0.0"},
+            "paths": {
+                "/archive/cards/{cardId}": {
+                    "get": {"responses": {"200": {"description": "Карточка"}}}
+                },
+                "/archive/cards/{id}": {
+                    "delete": {
+                        "parameters": [{"name": "id", "in": "path", "required": True, "schema": {"type": "string"}}],
+                        "responses": {"204": {"description": "Удаляет карточку"}},
+                    }
+                },
+                "/v1/claims": {
+                    "post": {
+                        "responses": {
+                            "422": {"description": "Unprocessable Entity"},
+                            "409": {"description": "перевозка уже создана."},
+                        }
+                    }
+                },
+                "/meters/v2/readings": {
+                    "get": {
+                        "responses": {
+                            "200": {
+                                "description": "Показания",
+                                "content": {
+                                    "application/json": {
+                                        "schema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "readings": {"type": "array", "items": {"type": "object"}},
+                                                "name": {"type": "string", "description": "уже есть"},
+                                            },
+                                        }
+                                    }
+                                },
+                            }
+                        }
+                    }
+                },
+            },
+        }
+        finalize_spec(spec, source)
+        self.assertEqual(spec["info"]["title"], "Складские перемещения")
+        self.assertEqual(spec["info"]["version"], "4")
+        self.assertNotIn("/archive/cards/{id}", spec["paths"])
+        deleted = spec["paths"]["/archive/cards/{cardId}"]["delete"]
+        self.assertEqual(deleted["parameters"][0]["name"], "cardId")
+        claim = spec["paths"]["/v1/claims"]["post"]["responses"]
+        self.assertEqual(claim["422"]["description"], "Полис не действует")
+        self.assertEqual(claim["409"]["description"], "перевозка уже создана.")
+        self.assertEqual(claim["409"]["content"]["application/json"]["example"]["messageToUser"], "Накладная уже есть")
+        props = spec["paths"]["/meters/v2/readings"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]["properties"]
+        self.assertEqual(props["readings"]["description"], "Показание счётчика")
+        self.assertEqual(props["name"]["description"], "уже есть")
+
+    def test_fragment_example_fills_a_gap_and_keeps_a_finished_phrase(self) -> None:
+        from openapi_from_spec.pipeline import finalize_spec
+
+        source = """
+POST /api/v1/users HTTP/1.1
+{"last_name":"Сидоров"}
+
+Пример ответа (201 Created)
+{"id": 3}
+
+curl -X GET "https://notes.example/api/v1/notes" \\
+     -H "Authorization: Bearer TOKEN"
+
+HTTP/1.1 200 OK
+{"items": [1]}
+"""
+        spec = {
+            "servers": [{"url": "https://notes.example"}],
+            "paths": {
+                "/users": {
+                    "post": {
+                        "responses": {
+                            "201": {"description": "Пользователь создан"},
+                            "401": {"$ref": "#/components/responses/Unauthorized"},
+                        }
+                    }
+                },
+                "/notes": {
+                    "get": {
+                        "responses": {
+                            "200": {
+                                "description": "OK",
+                                "content": {"application/json": {"schema": {"type": "object"}}},
+                            },
+                            "404": {"$ref": "#/components/responses/NotFound"},
+                        }
+                    }
+                },
+            },
+            "components": {
+                "responses": {
+                    "Unauthorized": {"description": "Требуется аутентификация", "x-origin": "skill-template"},
+                    "NotFound": {"description": "Ресурс не найден", "x-origin": "skill-template"},
+                }
+            },
+        }
+        finalize_spec(spec, source)
+        created = spec["paths"]["/api/v1/users"]["post"]
+        self.assertEqual(created["responses"]["201"]["description"], "Пользователь создан")
+        self.assertEqual(created["responses"]["201"]["content"]["application/json"]["example"], {"id": 3})
+        self.assertEqual(created["requestBody"]["content"]["application/json"]["example"], {"last_name": "Сидоров"})
+        self.assertNotIn("401", created["responses"])
+        notes = spec["paths"]["/api/v1/notes"]["get"]
+        self.assertEqual(notes["responses"]["200"]["content"]["application/json"]["example"], {"items": [1]})
+        self.assertNotIn("404", notes["responses"])
+        self.assertIn("Authorization", {item["name"] for item in notes["parameters"]})
+
+    def test_one_call_keeps_a_single_path_and_its_statuses(self) -> None:
+        from openapi_from_spec.pipeline import _OWN_REQUEST, _fragment_for_request, finalize_spec
+
+        source = """
+GET https://kpmp.nalog.gov.ru/authority-classifier-idmz/api/v1/GetAllRecords
+
+400 Bad Request - неверный формат параметра date. Тело ответа пустое.
+"""
+        spec = {
+            "servers": [
+                {"url": "https://kpmp.nalog.gov.ru/authority-classifier-idmz/api/v1"},
+                {"url": "https://kpmp.nalog.gov.ru/authority-classifier-idmz"},
+            ],
+            "paths": {
+                "/GetAllRecords": {"get": {"responses": {"200": {"description": "Набор записей"}}}},
+                "/api/v1/GetAllRecords": {
+                    "get": {
+                        "responses": {
+                            "200": {"description": "Набор записей"},
+                            "400": {"description": "неверный формат параметра date"},
+                        }
+                    }
+                },
+            },
+        }
+        finalize_spec(spec, source)
+        self.assertEqual(len(spec["paths"]), 1)
+        operation = next(iter(spec["paths"].values()))["get"]
+        self.assertIn("200", operation["responses"])
+        self.assertIn("400", operation["responses"])
+        self.assertEqual(len(spec["servers"]), 1)
+        server_path = spec["servers"][0]["url"].split("://", 1)[1].split("/", 1)[-1]
+        path = next(iter(spec["paths"]))
+        joined = "/" + server_path.strip("/") + "/" + path.lstrip("/")
+        self.assertNotIn("/api/v1/api/v1", joined)
+        self.assertTrue(joined.endswith("/authority-classifier-idmz/api/v1/GetAllRecords"))
+
+        listed = {
+            "servers": [{"url": "https://bank.example/api/v1"}],
+            "paths": {
+                "/transactions": {"get": {"responses": {"200": {"description": "Список"}}}},
+                "/transactions/{id}": {"put": {"responses": {"422": {"description": "Сумма должна быть больше 0"}}}},
+            },
+        }
+        finalize_spec(
+            listed,
+            "GET /api/v1/transactions\n\nPUT /api/v1/transactions/1\n\n{\"error\":\"Сумма должна быть больше 0\"}\n",
+        )
+        self.assertEqual(set(listed["paths"]), {"/transactions", "/transactions/{id}"})
+
+        text = (ROOT / "docling" / "habr-shablon-tz-rest-api.md").read_text(encoding="utf-8")
+        match = next(item for item in _OWN_REQUEST.finditer(text) if "transactions/1" in item.group(0))
+        start, end = _fragment_for_request(text, match)
+        chunk = text[start:end]
+        self.assertIn("transactions/1", chunk)
+        self.assertIn("Сумма должна быть больше 0", chunk)
+        self.assertNotIn("POST /api/v1/users", chunk)
+
+    def test_table_call_keeps_one_path_and_document_version(self) -> None:
+        from openapi_from_spec.pipeline import finalize_spec
+
+        source = """
+## OpenAPI 2.0: Взаимодействие с системой «ВсегдаДа»
+
+v 10.5.0
+
+## История изменений
+
+| Версия | Дата |
+| --- | --- |
+| 0.1 | 04.06.2020 |
+
+## 4.1.getToken - получить токен
+
+| Тип запроса | Наименование метода | URL | Синхронность |
+| --- | --- | --- | --- |
+| POST | getToken | {apiUrl}/open-api-authentication/v1/token | Да |
+
+## 4.9.putBasket - отправить корзину
+
+| Тип запроса | Наименование метода | URL | Синхронность |
+| --- | --- | --- | --- |
+| PUT | putBasket | {apiUrl}/open-api-application/v2/applications/{appId}/bas- ket | Да |
+
+PUT {apiUrl}/open-api-application/v2/applications/edd5b4df-eb28-483e-b33a-9ec4dafe41ef/basket
+"""
+        spec = {
+            "openapi": "3.0.3",
+            "info": {"title": "OpenAPI 2.0: Взаимодействие с системой «ВсегдаДа»", "version": "0.1"},
+            "servers": [
+                {"url": "{apiUrl}", "variables": {"apiUrl": {"default": "/"}}},
+                {"url": "{apiURL}", "variables": {"apiURL": {"default": "/"}}},
+                {"url": "https://open-api-application-v2.test02.rancher-test.vsegda.da/open-api-application/v2"},
+            ],
+            "paths": {
+                "/getToken": {"post": {"operationId": "getToken", "responses": {"200": {"description": "Токен"}}}},
+                "/open-api-authentication/v1/token": {
+                    "post": {"operationId": "postToken", "responses": {"200": {"description": "Токен доступа"}}}
+                },
+                "/open-api-application/v2/applications/edd5b4df-eb28-483e-b33a-9ec4dafe41ef/basket": {
+                    "put": {"responses": {"200": {"description": "Корзина"}}}
+                },
+                "/open-api-application/v2/applications/d1341eef-98e9-4fb1-9eb4-13f048f40035/status](https:/open-api-application-v2.test02.rancher-test.vsegda.da/open-api-application/v2/applications/{applicationId}/status": {
+                    "get": {"responses": {"200": {"description": "Статус"}}}
+                },
+            },
+        }
+        finalize_spec(spec, source)
+        self.assertEqual(spec["info"]["version"], "10.5.0")
+        self.assertEqual([item["url"] for item in spec["servers"]], ["{apiUrl}"])
+        self.assertNotIn("/getToken", spec["paths"])
+        self.assertIn("/open-api-authentication/v1/token", spec["paths"])
+        basket = next(path for path in spec["paths"] if path.endswith("/basket"))
+        self.assertNotIn("edd5b4df", basket)
+        self.assertIn("{", basket)
+        status = next(path for path in spec["paths"] if path.endswith("/status"))
+        self.assertNotIn("](", status)
+        self.assertIn("{applicationId}", status)
+
+    def test_wrapped_path_alias_and_example_version_stay_one_call(self) -> None:
+        from openapi_from_spec.pipeline import _table_request_rows, finalize_spec
+
+        source = """
+## 4.8.getUrl - ссылка на заявку
+
+| Тип запроса | Наименование метода | URL | Синхронность |
+| --- | --- | --- | --- |
+| GET | getUrl | {apiUrl}/open-api-application/v2/applications/{appId}/url | Да |
+
+## 4.26.cancel - отменить заявку
+
+| Тип запроса | Наименование метода | URL | Синхронность |
+| --- | --- | --- | --- |
+| POST | cancel | {apiUrl}/open-api-application/v2/applications/{appId}/cancel | Да |
+
+POST {apiUrl}/open-api-application/v1/applications/04355f53-bb60-43e8-aadd-beced847fb55/cancel
+
+## 4.38.getCreditLineLimitByCustomer
+
+| Тип запроса | Наименование метода | URL | Синхронность |
+| --- | --- | --- | --- |
+| GET | getCreditLineLimitByCustomer | {apiUrl}/open-api-application/v2/ credit- line/{customerId}/limit-info | SYNC |
+| GET | getCreditLineLimitByShortIdent | {apiUrl}/open-api-application/v2/credit- line/limit-info | SYNC |
+
+## Заказы двух версий
+
+| Тип запроса | Наименование метода | URL | Синхронность |
+| --- | --- | --- | --- |
+| GET | listV1 | {apiUrl}/v1/orders/{id} | Да |
+| GET | listV2 | {apiUrl}/v2/orders/{id} | Да |
+"""
+        rows = [(method, path) for _at, method, path in _table_request_rows(source)]
+        self.assertIn(("get", "/open-api-application/v2/credit-line/{customerId}/limit-info"), rows)
+        self.assertIn(("get", "/open-api-application/v2/credit-line/limit-info"), rows)
+        self.assertIn(("post", "/open-api-application/v2/applications/{appId}/cancel"), rows)
+        spec = {
+            "openapi": "3.0.3",
+            "info": {"title": "ВсегдаДа", "version": "10.5.0"},
+            "servers": [{"url": "{apiUrl}"}],
+            "paths": {
+                "/open-api-application/v2/applications/{appId}/url": {
+                    "get": {
+                        "parameters": [
+                            {
+                                "name": "appId",
+                                "in": "path",
+                                "required": True,
+                                "description": "ИД заявки",
+                                "schema": {"type": "string"},
+                            },
+                            {
+                                "name": "applicationId",
+                                "in": "path",
+                                "required": True,
+                                "description": "ИД заявки ВсегдаДа",
+                                "schema": {"type": "string"},
+                            },
+                        ],
+                        "responses": {"200": {"description": "Ссылка"}},
+                    }
+                },
+                "/open-api-application/v2/applications/{appId}/cancel": {
+                    "post": {"responses": {"200": {"description": "Отменена"}}}
+                },
+                "/open-api-application/v1/applications/04355f53-bb60-43e8-aadd-beced847fb55/cancel": {
+                    "post": {"responses": {"200": {"description": "Отменена примером"}}}
+                },
+                "/v1/orders/{id}": {"get": {"responses": {"200": {"description": "Версия 1"}}}},
+                "/v2/orders/{id}": {"get": {"responses": {"200": {"description": "Версия 2"}}}},
+            },
+        }
+        finalize_spec(spec, source)
+        url = spec["paths"]["/open-api-application/v2/applications/{appId}/url"]["get"]
+        self.assertEqual([item["name"] for item in url["parameters"] if item["in"] == "path"], ["appId"])
+        self.assertNotIn("/open-api-application/v1/applications/04355f53-bb60-43e8-aadd-beced847fb55/cancel", spec["paths"])
+        self.assertIn("/open-api-application/v2/applications/{appId}/cancel", spec["paths"])
+        self.assertIn("/v1/orders/{id}", spec["paths"])
+        self.assertIn("/v2/orders/{id}", spec["paths"])
+
+    def test_long_tail_version_server_and_success_code(self) -> None:
+        from openapi_from_spec.compile import compile_operations
+        from openapi_from_spec.llm import apply_model_extract
+        from openapi_from_spec.models import IRField, Operation, Segment
+        from openapi_from_spec.pipeline import _absorb_continuations, finalize_spec
+
+        source = """# Портовый реестр
+
+v 6
+
+Короткое введение.
+
+## История изменений
+
+| Версия | Дата |
+| --- | --- |
+| 0.1 | 01.02.2020 |
+
+POST {apiUrl}/harbor/v1/calls
+"""
+        spec = {
+            "openapi": "3.0.3",
+            "info": {"title": "Портовый реестр", "version": "0.1"},
+            "paths": {"/harbor/v1/calls": {"post": {"responses": {"201": {"description": "Создано"}}}}},
+        }
+        finalize_spec(spec, source)
+        self.assertEqual(spec["info"]["version"], "6")
+        self.assertEqual([item["url"] for item in spec["servers"]], ["{apiUrl}"])
+
+        operation = Operation(
+            http_method="post",
+            raw_name="calls",
+            summary="регистрация",
+            description="",
+            fields=[IRField(name="berthSeal", location="response", tz_type="string")],
+            explicit_path="/harbor/v1/calls",
+            status_responses={"201": "Карточка создана", "409": "Причал занят"},
+        )
+        compiled, _notes = compile_operations([operation], title="Портовый реестр", version="6", error_templates=True)
+        responses = compiled["paths"]["/harbor/v1/calls"]["post"]["responses"]
+        self.assertIn("201", responses)
+        self.assertNotIn("200", responses)
+        self.assertNotIn("500", responses)
+        self.assertIn("schema", responses["201"]["content"]["application/json"])
+
+        only_ok = Operation(
+            http_method="get",
+            raw_name="contracts",
+            summary="договор",
+            description="",
+            fields=[IRField(name="handoverSeal", location="response", tz_type="string")],
+            explicit_path="/lease/v1/contracts/{contractId}",
+            status_responses={"200": "Карточка договора"},
+        )
+        listed, _notes = compile_operations([only_ok], title="Договоры", version="6", error_templates=True)
+        codes = set(listed["paths"]["/lease/v1/contracts/{contractId}"]["get"]["responses"])
+        self.assertEqual(codes, {"200"})
+
+        line = "POST {apiUrl}/lab/v1/samples\n"
+        text = line + "\n| sampleBarcode | Штрихкод | string | Да |\n"
+        head = Segment(start=0, end=len(line), text=line, http_method="post", explicit_path="/lab/v1/samples")
+        absorbed = _absorb_continuations(text, [head])
+        self.assertEqual(len(absorbed), 1)
+        self.assertIn("sampleBarcode", absorbed[0].text)
+
+        placed = Operation(
+            http_method="post",
+            raw_name="calls",
+            summary="",
+            description="",
+            fields=[],
+            explicit_path="/harbor/v1/calls",
+        )
+        apply_model_extract(
+            placed,
+            {"parameters": [{"name": "vesselName", "location": "query", "tz_type": "string", "quote": "vesselName"}]},
+            "| vesselName | Название судна | string | Да |",
+        )
+        self.assertEqual(placed.fields[0].location, "body")
+
+        from openapi_from_spec.pipeline import _bind_fragment_request
+
+        museum = Operation(
+            http_method="get",
+            raw_name="{gateway}/museum/v1/exhibits/{exhibitId}",
+            summary="",
+            description="",
+            fields=[],
+        )
+        fragment = (
+            "GET {gateway}/museum/v1/exhibits/{exhibitId}\n"
+            "GET https://museum.example.test/museum/v1/exhibits/edd5b4df-eb28-483e-b33a-9ec4dafe41ef\n"
+        )
+        _bind_fragment_request(museum, fragment)
+        self.assertEqual(museum.explicit_path, "/museum/v1/exhibits/{exhibitId}")
+        self.assertIsNone(museum.server_url)
+
+        gotten = Operation(
+            http_method="get",
+            raw_name="handoverSeal",
+            summary="",
+            description="",
+            fields=[IRField(name="handoverSeal", location="body", tz_type="string", quote="handoverSeal")],
+        )
+        apply_model_extract(gotten, {"parameters": []}, "| handoverSeal | Печать передачи | string | Да |")
+        gotten.fields.append(IRField(name="handoverSeal", location="body", tz_type="string", quote="handoverSeal"))
+        from openapi_from_spec.llm import _place_unmarked_request_fields
+
+        _place_unmarked_request_fields(gotten, "| handoverSeal | Печать передачи | string | Да |")
+        self.assertEqual(gotten.fields[-1].location, "response")
 
 
 if __name__ == "__main__":

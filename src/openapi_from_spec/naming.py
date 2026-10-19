@@ -113,7 +113,7 @@ _ABSOLUTE_URL = re.compile(r"https?://[^\s)'\">]+", re.IGNORECASE)
 
 
 def find_template_url(text: str) -> tuple[str, str, str] | None:
-    """Глагол, сервер и путь из полного адреса. Адрес с {параметром} важнее примера без него."""
+    """Глагол, сервер и путь из полного адреса. Адрес с {параметром} важнее примера того же метода."""
     found: list[tuple[str, str, str, bool]] = []
     for match in _TEMPLATE_URL.finditer(text):
         url = match.group(2).rstrip(".,;")
@@ -130,7 +130,9 @@ def find_template_url(text: str) -> tuple[str, str, str] | None:
         )
     if not found:
         return None
-    method, server, path, _templated = next((item for item in found if item[3]), found[0])
+    owner = found[0][0]
+    same_method = [item for item in found if item[0] == owner]
+    method, server, path, _templated = next((item for item in same_method if item[3]), same_method[0])
     return method, server, path
 
 

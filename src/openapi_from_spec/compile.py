@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 import yaml
@@ -163,6 +164,14 @@ def _object_schema(
     return schema
 
 
+def _success_status(operation: Operation) -> str:
+    """Поля ответа относятся к названному 2xx. Код 200 остаётся, если метод его назвал или не назвал ни одного."""
+    named = [code for code in operation.status_responses if re.fullmatch(r"2\d\d", code)]
+    if not named or "200" in named:
+        return "200"
+    return sorted(named)[0]
+
+
 def _note(conventions: list[str], text: str) -> None:
     if text not in conventions:
         conventions.append(text)
@@ -174,10 +183,11 @@ def _path_for(operation: Operation, prefix: str, conventions: list[str]) -> str:
         for piece in operation.explicit_path.split("/"):
             if not piece:
                 continue
-            if piece.startswith("{") and piece.endswith("}"):
-                parts.append(piece)
+            bare = piece[:-5] if piece.lower().endswith(".json") else piece
+            if bare.startswith("{") and bare.endswith("}"):
+                parts.append(bare)
             else:
-                parts.append(kebab(piece))
+                parts.append(kebab(bare))
         return "/" + "/".join(parts)
     _note(conventions, f"К имени метода добавлен префикс {prefix}. В ТЗ полного пути не было.")
     slug = kebab(operation.raw_name)
@@ -209,6 +219,16 @@ def _resolve(schema: dict[str, Any], spec: dict[str, Any]) -> dict[str, Any]:
         return schema
     name = ref.rsplit("/", 1)[-1]
     return ((spec.get("components") or {}).get("schemas") or {}).get(name, {})
+
+
+def _response_schema(example: Any, resource_name: str) -> dict[str, Any]:
+    """Поля таблицы — сам ресурс. Пример `{data: ...}` оставляет эту обёртку в ответе."""
+    resource = {"$ref": f"#/components/schemas/{resource_name}"}
+    if isinstance(example, dict) and set(example) == {"data"} and isinstance(example["data"], list):
+        return {"type": "object", "properties": {"data": {"type": "array", "items": resource}}}
+    if isinstance(example, dict) and set(example) == {"data"} and isinstance(example["data"], dict):
+        return {"type": "object", "properties": {"data": resource}}
+    return resource
 
 
 def extra_example_fields(example: Any, schema: dict[str, Any], spec: dict[str, Any], prefix: str, gaps: list[Gap]) -> None:
@@ -290,27 +310,36 @@ def compile_operations(
             _note(conventions, "Тело запроса записано как application/json.")
 
         responses: dict[str, Any] = {}
-        success = operation.status_responses.get("200") or operation.summary or "Успешный ответ"
+        success_code = _success_status(operation)
+        success = (
+            operation.status_responses.get(success_code)
+            or operation.summary
+            or "Успешный ответ"
+        )
         if response_fields:
             response_schema = _object_schema(response_fields, registry, gaps, conventions)
             response_name = registry.hoist(pascal(operation.raw_name) + "Response", response_schema)
-            content = {"schema": {"$ref": f"#/components/schemas/{response_name}"}}
+            content = {"schema": _response_schema(operation.response_example, response_name)}
             if operation.response_example is not None:
                 content["example"] = operation.response_example
-            responses["200"] = {
+            responses[success_code] = {
                 "description": success,
                 "content": {"application/json": content},
             }
             _note(conventions, "Успешный ответ записан как application/json.")
         elif operation.response_example is not None:
-            responses["200"] = {
+            responses[success_code] = {
                 "description": success,
                 "content": {"application/json": {"schema": {}, "example": operation.response_example}},
             }
-        else:
-            responses["200"] = {"description": success}
-        documented = {code: text for code, text in operation.status_responses.items() if code != "200"}
-        if documented:
+        elif success_code in operation.status_responses or not operation.status_responses:
+            responses[success_code] = {"description": success}
+        documented = {
+            code: text
+            for code, text in operation.status_responses.items()
+            if code != success_code
+        }
+        if operation.status_responses:
             for code, description in documented.items():
                 responses[code] = {"description": description}
             _note(conventions, "Коды ответов взяты из текста метода, шаблон поверх них не ставился.")
