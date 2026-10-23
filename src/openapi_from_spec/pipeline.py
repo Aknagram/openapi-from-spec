@@ -13,12 +13,9 @@ from openapi_from_spec.compile import compile_operations, dump_yaml
 from openapi_from_spec.conventions import DEFAULT_PATH_PREFIX, ERROR_RESPONSES
 from openapi_from_spec.extract import extract_segment, needs_model
 from openapi_from_spec.llm import (
-    AgentBridgeClient,
-    DifyClient,
     LlmClient,
     VllmClient,
     apply_model_extract,
-    is_agent_base_url,
     nest_dotted_fields,
     prompt_pair,
 )
@@ -60,9 +57,6 @@ class Settings:
     vllm_base_url: str | None = None
     vllm_model: str | None = None
     vllm_api_key: str | None = None
-    dify_base_url: str | None = None
-    dify_api_key: str | None = None
-    dify_user: str = "openapi-from-spec"
     timeout_seconds: float = 120.0
 
     @classmethod
@@ -75,9 +69,6 @@ class Settings:
             vllm_base_url=os.environ.get("OPENAPI_VLLM_BASE_URL") or None,
             vllm_model=os.environ.get("OPENAPI_VLLM_MODEL") or None,
             vllm_api_key=os.environ.get("OPENAPI_VLLM_API_KEY") or None,
-            dify_base_url=os.environ.get("OPENAPI_DIFY_BASE_URL") or None,
-            dify_api_key=os.environ.get("OPENAPI_DIFY_API_KEY") or None,
-            dify_user=os.environ.get("OPENAPI_DIFY_USER") or "openapi-from-spec",
         )
 
 
@@ -105,8 +96,7 @@ def convert_text(text: str, settings: Settings | None = None, llm: LlmClient | N
         document_gaps.append(
             Gap(
                 "Документ на методы режет только модель. "
-                "Задайте OPENAPI_DIFY_BASE_URL и OPENAPI_DIFY_API_KEY "
-                "или OPENAPI_VLLM_BASE_URL и OPENAPI_VLLM_MODEL."
+                "Задайте OPENAPI_VLLM_BASE_URL и OPENAPI_VLLM_MODEL."
             )
         )
     spec, _notes = stitch_documents([], title=settings.title, version=settings.version)
@@ -115,15 +105,6 @@ def convert_text(text: str, settings: Settings | None = None, llm: LlmClient | N
 
 
 def _client_from_settings(settings: Settings) -> LlmClient | None:
-    if settings.dify_base_url and settings.dify_api_key:
-        return DifyClient(
-            settings.dify_base_url,
-            settings.dify_api_key,
-            settings.dify_user,
-            settings.timeout_seconds,
-        )
-    if is_agent_base_url(settings.vllm_base_url):
-        return AgentBridgeClient(timeout=max(settings.timeout_seconds, 1800.0))
     if settings.vllm_base_url and settings.vllm_model:
         return VllmClient(
             settings.vllm_base_url,

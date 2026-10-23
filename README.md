@@ -19,26 +19,22 @@ flowchart LR
     CORE["pipeline.convert_text"]
   end
 
-  subgraph models [Клиент модели, один из]
-    DIFY["DifyClient\nPOST /v1/chat-messages"]
+  subgraph models [Клиент модели]
     VLLM["VllmClient\n/chat/completions или Ollama /api/chat"]
-    AGENT["AgentBridge\nout/agent-bridge"]
   end
 
   CLI --> CORE
   PAGE --> HTTP
   CHAT -->|"файл .md/.txt и комментарий"| HTTP
   HTTP --> CORE
-  CORE --> DIFY
   CORE --> VLLM
-  CORE --> AGENT
   CORE --> OUT["YAML OpenAPI 3.0.3\nи JSON-отчёт"]
   HTTP --> OUT
 ```
 
 Страница и CLI отдают YAML вместе с отчётом. Chatflow Dify получает либо файл `openapi.yaml`, либо JSON `result=need_info`, если остались пробелы, методы без глагола HTTP или ошибки схемы. Адрес модели в браузер не попадает: его задаёт окружение сервера.
 
-Клиент выбирается так: ключи `OPENAPI_DIFY_*`, затем адрес `agent` или `cursor`, затем `OPENAPI_VLLM_*`. Имя модели для Dify задаёт приложение, сервис его не передаёт.
+Модель вызывает только `VllmClient`: нужны `OPENAPI_VLLM_BASE_URL` и `OPENAPI_VLLM_MODEL`.
 
 ```mermaid
 flowchart TB
@@ -65,7 +61,7 @@ flowchart TB
 | `api.py` | HTTP, JSON и multipart, ответ для Dify |
 | `pipeline.py` | Окна, вызовы модели, докрытие вызовов, `finalize_spec` |
 | `segment.py` | Нормализация, окна, хвост таблицы того же метода |
-| `llm.py` | `DifyClient`, `VllmClient`, `AgentBridge` |
+| `llm.py` | `VllmClient` |
 | `skill_loader.py` | Системный запрос под одну задачу |
 | `extract.py`, `tables.py`, `naming.py` | Разбор длинного метода: секции, таблицы, путь |
 | `compile.py` | `Operation` длинного метода в YAML |
@@ -97,24 +93,14 @@ python -m venv .venv
 
 ## Модель
 
-Если заданы `OPENAPI_DIFY_BASE_URL` и `OPENAPI_DIFY_API_KEY`, окна уходят в приложение Dify (`POST /v1/chat-messages`). Если в адресе нет `/v1`, клиент допишет его.
-
-```powershell
-$env:OPENAPI_DIFY_BASE_URL = "https://dify.example/v1"
-$env:OPENAPI_DIFY_API_KEY = "ключ-приложения-модели"
-.\.venv\Scripts\openapi-from-spec --serve --host 0.0.0.0
-```
-
-Без Dify то же делает OpenAI-совместимый сервер. `OPENAPI_VLLM_BASE_URL` уже содержит `/v1`, клиент дописывает `/chat/completions`. Локальный Ollama (порт `11434` или путь `/api`) идёт в `POST /api/chat`.
+Окна уходят в `VllmClient`. `OPENAPI_VLLM_BASE_URL` уже содержит `/v1`, клиент дописывает `/chat/completions`. Локальный Ollama (порт `11434` или путь `/api`) идёт в `POST /api/chat`.
 
 ```powershell
 $env:OPENAPI_VLLM_BASE_URL = "http://127.0.0.1:8000/v1"
 $env:OPENAPI_VLLM_MODEL = "имя-модели"
 $env:OPENAPI_VLLM_API_KEY = "ключ-если-нужен"
-.\.venv\Scripts\openapi-from-spec --serve
+.\.venv\Scripts\openapi-from-spec --serve --host 0.0.0.0
 ```
-
-`--vllm-base-url agent` (или `cursor`) пишет запрос в `out/agent-bridge` и ждёт файл ответа. Каталог меняет `OPENAPI_AGENT_BRIDGE_DIR`. Для `segment` и `extract` ответ — JSON, для `openapi` — YAML.
 
 Образец переменных — `.env.example`. Процесс сам файл не читает: переменные должны быть в окружении.
 

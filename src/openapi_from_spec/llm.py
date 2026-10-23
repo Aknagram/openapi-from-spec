@@ -1,12 +1,8 @@
 from __future__ import annotations
 
 import json
-import os
 import re
-import sys
 import time
-import uuid
-from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlparse
 
@@ -110,67 +106,6 @@ def ollama_chat_url(url: str | None) -> str | None:
     return f"{parsed.scheme}://{parsed.netloc}/api/chat"
 
 
-def is_agent_base_url(url: str | None) -> bool:
-    folded = (url or "").strip().lower().rstrip("/")
-    return folded in {"agent", "cursor"} or folded.startswith(("agent://", "cursor://"))
-
-
-class AgentBridgeClient:
-    """Временная подмена vLLM: запрос лежит в каталоге, ответ пишет агент.
-
-    Каталог — ``OPENAPI_AGENT_BRIDGE_DIR`` или ``out/agent-bridge``.
-    Для segment и extract файл ответа — JSON. Для openapi — YAML.
-    """
-
-    def __init__(self, directory: str | Path | None = None, timeout: float = 1800.0) -> None:
-        raw = directory or os.environ.get("OPENAPI_AGENT_BRIDGE_DIR")
-        self.directory = Path(raw) if raw else Path.cwd() / "out" / "agent-bridge"
-        self.timeout = timeout
-
-    def complete_json(self, *, task: str, system: str, user: str) -> dict[str, Any]:
-        self.directory.mkdir(parents=True, exist_ok=True)
-        request_id = uuid.uuid4().hex[:12]
-        request_path = self.directory / f"{request_id}.request.json"
-        response_path = self.directory / f"{request_id}.response.txt"
-        request_path.write_text(
-            json.dumps(
-                {"id": request_id, "task": task, "system": system, "user": user},
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-        print(
-            f"Ожидание ответа агента ({task}): {response_path}",
-            file=sys.stderr,
-            flush=True,
-        )
-        deadline = time.monotonic() + self.timeout
-        while time.monotonic() < deadline:
-            content = _stable_text(response_path)
-            if content is None:
-                time.sleep(0.2)
-                continue
-            request_path.unlink(missing_ok=True)
-            response_path.unlink(missing_ok=True)
-            if task == "openapi":
-                return {"yaml": content}
-            return parse_json_content(content)
-        raise RuntimeError(f"Агент не ответил за {self.timeout:.0f} с. Запрос: {request_path}")
-
-
-def _stable_text(path: Path) -> str | None:
-    if not path.is_file():
-        return None
-    first = path.read_text(encoding="utf-8")
-    if not first.strip():
-        return None
-    time.sleep(0.05)
-    if not path.is_file() or path.read_text(encoding="utf-8") != first:
-        return None
-    return first
-
-
 class VllmClient:
     """Клиент OpenAI-совместимого vLLM. Скилл передаётся в каждом запросе, сеть модели не нужна."""
 
@@ -206,92 +141,6 @@ class VllmClient:
                 raise RuntimeError(f"модель вернула HTTP {response.status_code}")
             body = response.json()
         content = _chat_content(body)
-        if task == "openapi":
-            return {"yaml": content}
-        return parse_json_content(content)
-
-
-def dify_v1_base(url: str) -> str:
-    """База Service API: .../v1, даже если в окружении указан только хост."""
-    parsed = urlparse((url or "").strip())
-    if not parsed.scheme or not parsed.netloc:
-        raise ValueError("адрес Dify должен содержать схему и хост")
-    path = parsed.path.rstrip("/")
-    if path.endswith("/chat-messages"):
-        path = path[: -len("/chat-messages")].rstrip("/")
-    if not path.endswith("/v1"):
-        path = f"{path}/v1"
-    return f"{parsed.scheme}://{parsed.netloc}{path}"
-
-
-def collect_dify_answer(lines) -> str:
-    """Собирает текст ответа из SSE chat-messages."""
-    parts: list[str] = []
-    fallback = ""
-    for line in lines:
-        text = str(line).strip()
-        if not text.startswith("data:"):
-            continue
-        raw = text[5:].strip()
-        if not raw or raw == "[DONE]":
-            continue
-        try:
-            event = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("Dify вернул не JSON в потоке") from exc
-        if not isinstance(event, dict):
-            continue
-        name = str(event.get("event") or "")
-        if name == "error":
-            raise RuntimeError(str(event.get("message") or "Dify вернул ошибку"))
-        if name in {"message", "agent_message"}:
-            parts.append(str(event.get("answer") or ""))
-            continue
-        if name == "workflow_finished":
-            data = event.get("data")
-            outputs = data.get("outputs") if isinstance(data, dict) else None
-            if isinstance(outputs, dict) and outputs.get("answer"):
-                fallback = str(outputs["answer"])
-    joined = "".join(parts).strip()
-    return joined or fallback.strip()
-
-
-class DifyClient:
-    """Вызов модели через chatflow Dify. Имя модели задаёт приложение, не этот клиент."""
-
-    def __init__(
-        self,
-        base_url: str,
-        api_key: str,
-        user: str = "openapi-from-spec",
-        timeout: float = 120.0,
-    ) -> None:
-        self.base_url = dify_v1_base(base_url)
-        self.api_key = api_key
-        self.user = user or "openapi-from-spec"
-        self.timeout = timeout
-
-    def complete_json(self, *, task: str, system: str, user: str) -> dict[str, Any]:
-        import httpx
-
-        payload = {
-            "inputs": {"system": system},
-            "query": user,
-            "response_mode": "streaming",
-            "conversation_id": "",
-            "user": self.user,
-        }
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-        }
-        with httpx.Client(timeout=self.timeout) as client:
-            with client.stream("POST", f"{self.base_url}/chat-messages", headers=headers, json=payload) as response:
-                if response.status_code >= 400:
-                    response.read()
-                    raise RuntimeError(f"Dify вернул HTTP {response.status_code}")
-                content = collect_dify_answer(response.iter_lines())
         if task == "openapi":
             return {"yaml": content}
         return parse_json_content(content)

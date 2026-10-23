@@ -22,11 +22,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--server-url")
     parser.add_argument(
         "--vllm-base-url",
-        help="База /v1 совместимого сервера. Значение agent ждёт ответ в out/agent-bridge.",
+        help="База OpenAI-совместимого /v1 или локального Ollama.",
     )
     parser.add_argument("--vllm-model")
-    parser.add_argument("--dify-base-url", help="База Dify. Клиент дописывает /v1/chat-messages.")
-    parser.add_argument("--dify-api-key", help="API-ключ приложения Dify с моделью.")
     parser.add_argument("--no-error-templates", action="store_true")
     parser.add_argument("--strict", action="store_true", help="Ненулевой код, если остались вопросы по ТЗ.")
     parser.add_argument("--serve", action="store_true", help="Локальная страница сборки.")
@@ -89,10 +87,6 @@ def _settings(args: argparse.Namespace) -> Settings:
         settings.vllm_base_url = args.vllm_base_url
     if args.vllm_model:
         settings.vllm_model = args.vllm_model
-    if args.dify_base_url:
-        settings.dify_base_url = args.dify_base_url
-    if args.dify_api_key:
-        settings.dify_api_key = args.dify_api_key
     if args.no_error_templates:
         settings.error_templates = False
     return settings

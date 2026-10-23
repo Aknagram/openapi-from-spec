@@ -5,13 +5,12 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import yaml
 
 from openapi_from_spec.api import make_server
-from openapi_from_spec.llm import DifyClient, _chat_content, dify_v1_base, ollama_chat_url
+from openapi_from_spec.llm import VllmClient, _chat_content, ollama_chat_url
 from openapi_from_spec.compile import compile_operations, dump_yaml
 from openapi_from_spec.pipeline import Settings, _client_from_settings, _finish_operation, _report, convert_text
 from openapi_from_spec.validate import validate_document
@@ -1932,6 +1931,15 @@ class OllamaClientTests(unittest.TestCase):
         self.assertIsNone(ollama_chat_url("https://api.z.ai/api/paas/v4"))
         self.assertEqual(_chat_content({"message": {"role": "assistant", "content": "ready"}}), "ready")
 
+    def test_settings_build_vllm_client(self) -> None:
+        client = _client_from_settings(
+            Settings(vllm_base_url="http://127.0.0.1:11434/api", vllm_model="qwen", vllm_api_key="key")
+        )
+        self.assertIsInstance(client, VllmClient)
+        self.assertEqual(client.base_url, "http://127.0.0.1:11434/api")
+        self.assertEqual(client.model, "qwen")
+        self.assertIsNone(_client_from_settings(Settings(vllm_base_url="http://127.0.0.1:8000/v1")))
+
 
 class ApiTests(unittest.TestCase):
     def test_convert_over_http(self) -> None:
@@ -2022,7 +2030,7 @@ def _post_file(port: int, filename: str, payload: bytes, title: str = "") -> _Re
         return _Response(response.headers, response.read())
 
 
-class DifyClientTests(unittest.TestCase):
+class DifyChatflowTests(unittest.TestCase):
     def test_dify_chatflow_forwards_file_and_comment(self) -> None:
         chat = yaml.safe_load((ROOT / "dify" / "tz-to-openapi.yml").read_text(encoding="utf-8"))
         self.assertEqual(chat["version"], "0.6.0")
@@ -2037,82 +2045,6 @@ class DifyClientTests(unittest.TestCase):
         self.assertEqual(fields["file"]["file"], ["sys", "files"])
         self.assertEqual(fields["clarification"]["value"], "{{#sys.query#}}")
         self.assertIn("{{#http.body#}}", nodes["answer"]["answer"])
-
-    def test_base_url_gains_v1(self) -> None:
-        self.assertEqual(dify_v1_base("https://dify.example"), "https://dify.example/v1")
-        self.assertEqual(dify_v1_base("https://dify.example/v1/"), "https://dify.example/v1")
-        self.assertEqual(
-            dify_v1_base("https://dify.example/v1/chat-messages"),
-            "https://dify.example/v1",
-        )
-
-    def test_dify_client_is_preferred_over_vllm(self) -> None:
-        client = _client_from_settings(
-            Settings(
-                dify_base_url="https://dify.example",
-                dify_api_key="app-key",
-                vllm_base_url="http://127.0.0.1:11434/api",
-                vllm_model="qwen",
-            )
-        )
-        self.assertIsInstance(client, DifyClient)
-        self.assertEqual(client.base_url, "https://dify.example/v1")
-
-    def test_streaming_chat_does_not_send_model_name(self) -> None:
-        seen: list[tuple[str, dict]] = []
-
-        class Handler(BaseHTTPRequestHandler):
-            def do_POST(self) -> None:
-                length = int(self.headers.get("Content-Length") or "0")
-                payload = json.loads(self.rfile.read(length).decode("utf-8"))
-                seen.append((self.path, payload))
-                query = payload.get("query")
-                if query == "fail":
-                    events = [json.dumps({"event": "error", "message": "сломанный узел"})]
-                elif query == "yaml":
-                    events = [json.dumps({"event": "message", "answer": "openapi: 3.0.3\n"})]
-                else:
-                    events = [
-                        json.dumps({"event": "message", "answer": '{"ok":'}),
-                        json.dumps({"event": "agent_message", "answer": " true}"}),
-                    ]
-                encoded = "".join(f"data: {event}\n\n" for event in events).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Content-Length", str(len(encoded)))
-                self.end_headers()
-                self.wfile.write(encoded)
-
-            def log_message(self, fmt: str, *args: object) -> None:
-                return
-
-        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        port = server.server_address[1]
-        try:
-            client = DifyClient(f"http://127.0.0.1:{port}", "secret-key", timeout=10)
-            self.assertEqual(
-                client.complete_json(task="extract", system="system-skill", user="fragment"),
-                {"ok": True},
-            )
-            path, payload = seen[0]
-            self.assertEqual(path, "/v1/chat-messages")
-            self.assertNotIn("model", payload)
-            self.assertEqual(payload["inputs"], {"system": "system-skill"})
-            self.assertEqual(payload["query"], "fragment")
-            self.assertEqual(payload["response_mode"], "streaming")
-            self.assertEqual(payload["conversation_id"], "")
-            self.assertEqual(payload["user"], "openapi-from-spec")
-            self.assertEqual(
-                client.complete_json(task="openapi", system="system-skill", user="yaml"),
-                {"yaml": "openapi: 3.0.3"},
-            )
-            with self.assertRaises(RuntimeError):
-                client.complete_json(task="extract", system="system-skill", user="fail")
-        finally:
-            server.shutdown()
-            server.server_close()
 
 
 class RequestBoundaryTests(unittest.TestCase):
